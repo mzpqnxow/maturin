@@ -56,14 +56,13 @@ class PostInstallCommand(install):
                     "(https://www.rust-lang.org/tools/install) and try again"
                 )
             subprocess.check_call(
-                 ['cargo', 'install', 'maturin', '--no-default-features', '--features=auditwheel,log,human-panic'])
+		['cargo', 'install', 'maturin', '--no-default-features', '--features=auditwheel,log,human-panic'])
+            )
             source = os.path.join(source_dir, "target", "debug", executable_name)
             source = os.path.join(os.getenv('VIRTUAL_ENV'), 'bin', 'maturin')
-
         # run this after trying to build with cargo (as otherwise this leaves
         # venv in a bad state: https://github.com/benfred/py-spy/issues/69)
         install.run(self)
-
         target = os.path.join(self.install_scripts, executable_name)
         os.makedirs(self.install_scripts, exist_ok=True)
         self.copy_file(source, target)
