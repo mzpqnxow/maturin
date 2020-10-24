@@ -1,0 +1,15 @@
+--- ../setup.py	2020-08-17 14:47:52.000000000 +0000
++++ setup.py	2020-10-24 21:25:06.074357597 +0000
+@@ -56,9 +56,10 @@
+                     "(https://www.rust-lang.org/tools/install) and try again"
+                 )
+             subprocess.check_call(
+-                ["cargo", "rustc", "--bin", "maturin", "--", "-C", "link-arg=-s"]
+-            )
++                 ['cargo', 'install', 'maturin', '--no-default-features', '--features=auditwheel,log,human-panic'])
+             source = os.path.join(source_dir, "target", "debug", executable_name)
++            source = os.path.join(os.getenv('HOME'), '.cargo', 'bin', 'maturin')
++
+         # run this after trying to build with cargo (as otherwise this leaves
+         # venv in a bad state: https://github.com/benfred/py-spy/issues/69)
+         install.run(self)
