@@ -56,6 +56,13 @@ class PostInstallCommand(install):
                     "(https://www.rust-lang.org/tools/install) and try again"
                 )
             subprocess.check_call(
+                 #
+                 # Including only these features will prevent ring from becoming a dependency
+                 # to work around the open issue on ppc64le:
+                 #   https://github.com/briansmith/ring/issues/389
+                 # For more on this workaround, see:
+                 #   https://github.com/PyO3/maturin/issues/366
+                 #
                  ['cargo', 'install', 'maturin', '--no-default-features', '--features=auditwheel,log,human-panic'])
             source = os.path.join(source_dir, "target", "debug", executable_name)
             source = os.path.join(os.getenv('HOME'), '.cargo', 'bin', 'maturin')
