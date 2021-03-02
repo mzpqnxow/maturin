@@ -5,9 +5,10 @@ use crate::Manylinux;
 use crate::PythonInterpreter;
 use crate::Target;
 use crate::{write_dist_info, BuildOptions};
-use anyhow::{anyhow, format_err, Context, Result};
-use std::fs;
+use anyhow::{anyhow, bail, format_err, Context, Result};
+use fs_err as fs;
 use std::path::Path;
+use std::process::Command;
 
 /// Installs a crate by compiling it and copying the shared library to site-packages.
 /// Also adds the dist-info directory to make sure pip and other tools detect the library
@@ -27,7 +28,7 @@ pub fn develop(
     let python = target.get_venv_python(&venv_dir);
 
     let build_options = BuildOptions {
-        manylinux: Manylinux::Off,
+        manylinux: Some(Manylinux::Off),
         interpreter: Some(vec![target.get_python()]),
         bindings,
         manifest_path: manifest_file.to_path_buf(),
@@ -36,6 +37,7 @@ pub fn develop(
         target: None,
         cargo_extra_args,
         rustc_extra_args,
+        universal2: false,
     };
 
     let build_context = build_options.into_build_context(release, strip)?;
@@ -44,6 +46,25 @@ pub fn develop(
         .ok_or_else(|| {
             anyhow!("Expected `python` to be a python interpreter inside a virtualenv ಠ_ಠ")
         })?;
+
+    // Install dependencies
+    if !build_context.metadata21.requires_dist.is_empty() {
+        let mut args = vec!["-m", "pip", "install"];
+        args.extend(
+            build_context
+                .metadata21
+                .requires_dist
+                .iter()
+                .map(|x| x.as_str()),
+        );
+        let status = Command::new(&interpreter.executable)
+            .args(&args)
+            .status()
+            .context("Failed to run pip install")?;
+        if !status.success() {
+            bail!(r#"pip install finished with "{}""#, status,)
+        }
+    }
 
     let mut builder = PathWriter::venv(&target, &venv_dir, &build_context.bridge)?;
 
@@ -81,7 +102,7 @@ pub fn develop(
                 true,
             )?;
         }
-        BridgeModel::Bindings(_) | BridgeModel::BindingsAbi3 => {
+        BridgeModel::Bindings(_) => {
             let artifact = build_context
                 .compile_cdylib(Some(&interpreter), Some(&build_context.module_name))
                 .context(context)?;
@@ -91,9 +112,25 @@ pub fn develop(
                 &build_context.project_layout,
                 &build_context.module_name,
                 &artifact,
-                &interpreter,
+                Some(&interpreter),
+                &target,
                 true,
-                build_context.bridge == BridgeModel::BindingsAbi3,
+            )?;
+        }
+        BridgeModel::BindingsAbi3(_, _) => {
+            let artifact = build_context
+                // We need the interpreter on windows
+                .compile_cdylib(Some(&interpreter), Some(&build_context.module_name))
+                .context(context)?;
+
+            write_bindings_module(
+                &mut builder,
+                &build_context.project_layout,
+                &build_context.module_name,
+                &artifact,
+                None,
+                &target,
+                true,
             )?;
         }
     }
@@ -101,15 +138,18 @@ pub fn develop(
     // Write dist-info directory so pip can interact with it
     let tags = match build_context.bridge {
         BridgeModel::Bindings(_) => {
-            vec![build_context.interpreter[0].get_tag(&build_context.manylinux, false)]
+            vec![build_context.interpreter[0]
+                .get_tag(&build_context.manylinux, build_context.universal2)]
         }
-        BridgeModel::BindingsAbi3 => {
-            vec![build_context.interpreter[0].get_tag(&build_context.manylinux, true)]
+        BridgeModel::BindingsAbi3(major, minor) => {
+            let platform =
+                target.get_platform_tag(&build_context.manylinux, build_context.universal2);
+            vec![format!("cp{}{}-abi3-{}", major, minor, platform)]
         }
         BridgeModel::Bin | BridgeModel::Cffi => {
             build_context
                 .target
-                .get_universal_tags(&build_context.manylinux)
+                .get_universal_tags(&build_context.manylinux, build_context.universal2)
                 .1
         }
     };

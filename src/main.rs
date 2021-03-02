@@ -7,16 +7,20 @@ use anyhow::{bail, Context, Result};
 #[cfg(feature = "upload")]
 use bytesize::ByteSize;
 use cargo_metadata::MetadataCommand;
+#[cfg(feature = "upload")]
+use configparser::ini::Ini;
+use fs_err as fs;
 #[cfg(feature = "human-panic")]
 use human_panic::setup_panic;
 #[cfg(feature = "password-storage")]
 use keyring::{Keyring, KeyringError};
 use maturin::{
-    develop, get_pyproject_toml, source_distribution, write_dist_info, BridgeModel, BuildOptions,
-    CargoToml, Metadata21, PathWriter, PythonInterpreter, Target,
+    develop, get_metadata_for_distribution, get_pyproject_toml, source_distribution,
+    write_dist_info, BridgeModel, BuildOptions, CargoToml, Metadata21, PathWriter,
+    PythonInterpreter, Target,
 };
+use std::env;
 use std::path::PathBuf;
-use std::{env, fs};
 use structopt::StructOpt;
 #[cfg(feature = "upload")]
 use {
@@ -34,9 +38,9 @@ use {
 /// 2. keyring
 /// 3. stdin
 #[cfg(feature = "upload")]
-fn get_password(_username: &str) -> (String, bool) {
+fn get_password(_username: &str) -> String {
     if let Ok(password) = env::var("MATURIN_PASSWORD") {
-        return (password, false);
+        return password;
     };
 
     #[cfg(feature = "keyring")]
@@ -44,21 +48,18 @@ fn get_password(_username: &str) -> (String, bool) {
         let service = env!("CARGO_PKG_NAME");
         let keyring = Keyring::new(&service, &_username);
         if let Ok(password) = keyring.get_password() {
-            return (password, true);
+            return password;
         };
     }
 
-    let password = rpassword::prompt_password_stdout("Please enter your password: ")
-        .unwrap_or_else(|_| {
-            // So we need this fallback for pycharm on windows
-            let mut password = String::new();
-            io::stdin()
-                .read_line(&mut password)
-                .expect("Failed to read line");
-            password.trim().to_string()
-        });
-
-    (password, true)
+    rpassword::prompt_password_stdout("Please enter your password: ").unwrap_or_else(|_| {
+        // So we need this fallback for pycharm on windows
+        let mut password = String::new();
+        io::stdin()
+            .read_line(&mut password)
+            .expect("Failed to read line");
+        password.trim().to_string()
+    })
 }
 
 #[cfg(feature = "upload")]
@@ -70,17 +71,77 @@ fn get_username() -> String {
 }
 
 #[cfg(feature = "upload")]
-/// Asks for username and password for a registry account where missing.
-fn complete_registry(opt: &PublishOpt) -> Result<(Registry, bool)> {
+fn load_pypirc() -> Ini {
+    let mut config = Ini::new();
+    if let Some(mut config_path) = dirs::home_dir() {
+        config_path.push(".pypirc");
+        if let Ok(pypirc) = fs::read_to_string(config_path.as_path()) {
+            let _ = config.read(pypirc);
+        }
+    }
+    config
+}
+
+#[cfg(feature = "upload")]
+fn load_pypi_cred_from_config(config: &Ini, registry_name: &str) -> Option<(String, String)> {
+    if let (Some(username), Some(password)) = (
+        config.get(registry_name, "username"),
+        config.get(registry_name, "password"),
+    ) {
+        return Some((username, password));
+    }
+    None
+}
+
+#[cfg(feature = "upload")]
+fn resolve_pypi_cred(
+    opt: &PublishOpt,
+    config: &Ini,
+    registry_name: Option<&str>,
+) -> (String, String) {
+    // API token from environment variable takes priority
+    if let Ok(token) = env::var("MATURIN_PYPI_TOKEN") {
+        return ("__token__".to_string(), token);
+    }
+
+    if let Some((username, password)) =
+        registry_name.and_then(|name| load_pypi_cred_from_config(&config, name))
+    {
+        println!("🔐 Using credential in pypirc for upload");
+        return (username, password);
+    }
+
+    // fallback to username and password
     let username = opt.username.clone().unwrap_or_else(get_username);
-    let (password, reenter) = match opt.password {
-        Some(ref password) => (password.clone(), false),
+    let password = match opt.password {
+        Some(ref password) => password.clone(),
         None => get_password(&username),
     };
 
-    let registry = Registry::new(username, password, Url::parse(&opt.registry)?);
+    (username, password)
+}
 
-    Ok((registry, reenter))
+#[cfg(feature = "upload")]
+/// Asks for username and password for a registry account where missing.
+fn complete_registry(opt: &PublishOpt) -> Result<Registry> {
+    // load creds from pypirc if found
+    let pypirc = load_pypirc();
+    let (register_name, registry_url) =
+        if !opt.registry.starts_with("http://") && !opt.registry.starts_with("https://") {
+            if let Some(url) = pypirc.get(&opt.registry, "repository") {
+                (Some(opt.registry.as_str()), url)
+            } else {
+                bail!("Failed to get registry {} in .pypirc", opt.registry);
+            }
+        } else if opt.registry == "https://upload.pypi.org/legacy/" {
+            (Some("pypi"), opt.registry.clone())
+        } else {
+            (None, opt.registry.clone())
+        };
+    let (username, password) = resolve_pypi_cred(opt, &pypirc, register_name);
+    let registry = Registry::new(username, password, Url::parse(&registry_url)?);
+
+    Ok(registry)
 }
 
 /// An account with a registry, possibly incomplete
@@ -106,6 +167,10 @@ struct PublishOpt {
     /// Do not strip the library for minimum file size
     #[structopt(long = "no-strip")]
     no_strip: bool,
+    /// Continue uploading files if one already exists.
+    /// (Only valid when uploading to PyPI. Other implementations may not support this.)
+    #[structopt(long = "skip-existing")]
+    skip_existing: bool,
 }
 
 #[derive(Debug, StructOpt)]
@@ -197,10 +262,21 @@ enum Opt {
         #[structopt(short, long, parse(from_os_str))]
         out: Option<PathBuf>,
     },
+    /// WIP Upload command, similar to twine
+    ///
+    /// ```
+    /// maturin upload dist/*
+    /// ```
+    #[structopt(name = "upload", setting = structopt::clap::AppSettings::Hidden)]
+    Upload {
+        /// Wheels and source distributions to upload
+        #[structopt(name = "FILE", parse(from_os_str))]
+        files: Vec<PathBuf>,
+    },
     /// Backend for the PEP 517 integration. Not for human consumption
     ///
     /// The commands are meant to be called from the python PEP 517
-    #[structopt(name = "pep517")]
+    #[structopt(name = "pep517", setting = structopt::clap::AppSettings::Hidden)]
     PEP517(PEP517Command),
 }
 
@@ -267,13 +343,19 @@ fn pep517(subcommand: PEP517Command) -> Result<()> {
             let context = build_options.into_build_context(true, strip)?;
             let tags = match context.bridge {
                 BridgeModel::Bindings(_) => {
-                    vec![context.interpreter[0].get_tag(&context.manylinux, false)]
+                    vec![context.interpreter[0].get_tag(&context.manylinux, context.universal2)]
                 }
-                BridgeModel::BindingsAbi3 => {
-                    vec![context.interpreter[0].get_tag(&context.manylinux, true)]
+                BridgeModel::BindingsAbi3(major, minor) => {
+                    let platform = context
+                        .target
+                        .get_platform_tag(&context.manylinux, context.universal2);
+                    vec![format!("cp{}{}-abi3-{}", major, minor, platform)]
                 }
                 BridgeModel::Bin | BridgeModel::Cffi => {
-                    context.target.get_universal_tags(&context.manylinux).1
+                    context
+                        .target
+                        .get_universal_tags(&context.manylinux, context.universal2)
+                        .1
                 }
             };
 
@@ -285,7 +367,7 @@ fn pep517(subcommand: PEP517Command) -> Result<()> {
             let build_context = build.into_build_context(true, strip)?;
             let wheels = build_context.build_wheels()?;
             assert_eq!(wheels.len(), 1);
-            println!("{}", wheels[0].0.file_name().unwrap().to_str().unwrap());
+            println!("{}", wheels[0].0.to_str().unwrap());
         }
         PEP517Command::WriteSDist {
             sdist_directory,
@@ -295,8 +377,19 @@ fn pep517(subcommand: PEP517Command) -> Result<()> {
             let manifest_dir = manifest_path.parent().unwrap();
             let metadata21 = Metadata21::from_cargo_toml(&cargo_toml, &manifest_dir)
                 .context("Failed to parse Cargo.toml into python metadata")?;
-            let path = source_distribution(sdist_directory, &metadata21, &manifest_path, None)
-                .context("Failed to build source distribution")?;
+            let cargo_metadata = MetadataCommand::new()
+                .manifest_path(&manifest_path)
+                .exec()
+                .context("Cargo metadata failed. Do you have cargo in your PATH?")?;
+
+            let path = source_distribution(
+                sdist_directory,
+                &metadata21,
+                &manifest_path,
+                &cargo_metadata,
+                None,
+            )
+            .context("Failed to build source distribution")?;
             println!("{}", path.file_name().unwrap().to_str().unwrap());
         }
     };
@@ -304,7 +397,7 @@ fn pep517(subcommand: PEP517Command) -> Result<()> {
     Ok(())
 }
 
-/// Handles authentification/keyring integration and retrying of the publish subcommand
+/// Handles authentication/keyring integration and retrying of the publish subcommand
 #[cfg(feature = "upload")]
 fn upload_ui(build: BuildOptions, publish: &PublishOpt, no_sdist: bool) -> Result<()> {
     let build_context = build.into_build_context(!publish.debug, !publish.no_strip)?;
@@ -321,27 +414,20 @@ fn upload_ui(build: BuildOptions, publish: &PublishOpt, no_sdist: bool) -> Resul
         }
     }
 
-    let (mut registry, reenter) = complete_registry(&publish)?;
+    let registry = complete_registry(&publish)?;
 
-    loop {
-        println!("🚀 Uploading {} packages", wheels.len());
+    println!("🚀 Uploading {} packages", wheels.len());
 
-        let upload_result = wheels
-            .iter()
-            .map(|(wheel_path, supported_versions, _)| {
-                let result = upload(
-                    &registry,
-                    &wheel_path,
-                    &build_context.metadata21,
-                    &supported_versions,
-                );
-                result.map_err(|err| (wheel_path.clone(), err))
-            })
-            .collect();
-
+    for (wheel_path, supported_versions) in wheels {
+        let upload_result = upload(
+            &registry,
+            &wheel_path,
+            &build_context.metadata21.to_vec(),
+            &supported_versions,
+        );
         match upload_result {
-            Ok(()) => break,
-            Err((_, UploadError::AuthenticationError)) if reenter => {
+            Ok(()) => (),
+            Err(UploadError::AuthenticationError) => {
                 println!("⛔ Username and/or password are wrong");
 
                 #[cfg(feature = "keyring")]
@@ -350,43 +436,39 @@ fn upload_ui(build: BuildOptions, publish: &PublishOpt, no_sdist: bool) -> Resul
                     let old_username = registry.username.clone();
                     let keyring = Keyring::new(&env!("CARGO_PKG_NAME"), &old_username);
                     match keyring.delete_password() {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            println!("🔑 Removed wrong password from keyring")
+                        }
                         Err(KeyringError::NoPasswordFound) | Err(KeyringError::NoBackendFound) => {}
-                        _ => eprintln!("⚠ Failed to remove password from keyring"),
+                        Err(err) => eprintln!("⚠ Failed to remove password from keyring: {}", err),
                     }
                 }
 
-                let username = get_username();
-                let password = rpassword::prompt_password_stdout("Please enter your password: ")
-                    .unwrap_or_else(|_| {
-                        // So we need this fallback for pycharm on windows
-                        let mut password = String::new();
-                        io::stdin()
-                            .read_line(&mut password)
-                            .expect("Failed to read line");
-                        password.trim().to_string()
-                    });
-
-                registry = Registry::new(username, password, registry.url);
-                println!("… Retrying");
-            }
-            Err((_, UploadError::AuthenticationError)) => {
                 bail!("Username and/or password are wrong");
             }
-            Err((wheel_path, err)) => {
-                let filesize = std::fs::metadata(&wheel_path)
+            Err(err) => {
+                let filename = wheel_path.file_name().unwrap_or(&wheel_path.as_os_str());
+                if let UploadError::FileExistsError(_) = err {
+                    if publish.skip_existing {
+                        eprintln!(
+                            "⚠  Skipping {:?} because it appears to already exist",
+                            filename
+                        );
+                        continue;
+                    }
+                }
+                let filesize = fs::metadata(&wheel_path)
                     .map(|x| ByteSize(x.len()).to_string())
                     .unwrap_or_else(|e| {
                         format!("Failed to get the filesize of {:?}: {}", &wheel_path, e)
                     });
-                let filename = wheel_path.file_name().unwrap_or(&wheel_path.as_os_str());
                 return Err(err)
-                    .context(format!("💥 Failed to upload {:?} ({})", filename, filesize))?;
+                    .context(format!("💥 Failed to upload {:?} ({})", filename, filesize));
             }
         }
     }
 
-    println!("✨ Packages uploaded succesfully");
+    println!("✨ Packages uploaded successfully");
 
     #[cfg(feature = "keyring")]
     {
@@ -394,9 +476,13 @@ fn upload_ui(build: BuildOptions, publish: &PublishOpt, no_sdist: bool) -> Resul
         let username = registry.username.clone();
         let keyring = Keyring::new(&env!("CARGO_PKG_NAME"), &username);
         let password = registry.password.clone();
-        keyring.set_password(&password).unwrap_or_else(|e| {
-            eprintln!("⚠ Failed to store the password in the keyring: {:?}", e)
-        });
+        match keyring.set_password(&password) {
+            Ok(()) => {}
+            Err(KeyringError::NoBackendFound) => {}
+            Err(err) => {
+                eprintln!("⚠ Failed to store the password in the keyring: {:?}", err);
+            }
+        }
     }
 
     Ok(())
@@ -446,12 +532,19 @@ fn run() -> Result<()> {
             release,
             strip,
         } => {
-            let venv_dir = match (env::var_os("VIRTUAL_ENV"),env::var_os("CONDA_PREFIX")) {
+            let venv_dir = match (env::var_os("VIRTUAL_ENV"), env::var_os("CONDA_PREFIX")) {
                 (Some(dir), None) => PathBuf::from(dir),
                 (None, Some(dir)) => PathBuf::from(dir),
-                (Some(_), Some(_)) => bail!("Both VIRTUAL_ENV and CONDA_PREFIX are set. Please unset one of them"),
+                (Some(_), Some(_)) => {
+                    bail!("Both VIRTUAL_ENV and CONDA_PREFIX are set. Please unset one of them")
+                }
                 (None, None) => {
-                    bail!("You need to be inside a virtualenv or conda environment to use develop (neither VIRTUAL_ENV nor CONDA_PREFIX are set)")
+                    bail!(
+                        "You need to be inside a virtualenv or conda environment to use develop \
+                        (neither VIRTUAL_ENV nor CONDA_PREFIX are set). \
+                        See https://virtualenv.pypa.io/en/latest/index.html on how to use virtualenv or \
+                        use `maturin build` and `pip install <path/to/wheel>` instead."
+                    )
                 }
             };
 
@@ -493,11 +586,24 @@ fn run() -> Result<()> {
                 &wheel_dir,
                 &metadata21,
                 &manifest_path,
+                &cargo_metadata,
                 pyproject.sdist_include(),
             )
             .context("Failed to build source distribution")?;
         }
         Opt::PEP517(subcommand) => pep517(subcommand)?,
+        Opt::Upload { files } => {
+            if files.is_empty() {
+                println!("⚠  Warning: No files given, exiting.");
+                return Ok(());
+            }
+            let metadata: Vec<Vec<(String, String)>> = files
+                .iter()
+                .map(|path| get_metadata_for_distribution(&path))
+                .collect::<Result<_>>()?;
+
+            println!("{:?}", metadata);
+        }
     }
 
     Ok(())

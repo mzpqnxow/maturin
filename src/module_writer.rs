@@ -7,11 +7,13 @@ use crate::{BridgeModel, Metadata21};
 use anyhow::{anyhow, bail, Context, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use fs_err as fs;
+use fs_err::File;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs;
-use std::fs::File;
+#[cfg(not(target_os = "windows"))]
+use std::fs::OpenOptions;
 use std::io;
 use std::io::{Read, Write};
 #[cfg(not(target_os = "windows"))]
@@ -46,10 +48,27 @@ pub trait ModuleWriter {
     /// Copies the source file the the target path relative to the module base path
     fn add_file(&mut self, target: impl AsRef<Path>, source: impl AsRef<Path>) -> Result<()> {
         let read_failed_context = format!("Failed to read {}", source.as_ref().display());
-        let mut file = File::open(&source).context(read_failed_context.clone())?;
+        let mut file = File::open(source.as_ref()).context(read_failed_context.clone())?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer).context(read_failed_context)?;
         self.add_bytes(&target, &buffer)
+            .context(format!("Failed to write to {}", target.as_ref().display()))?;
+        Ok(())
+    }
+
+    /// Copies the source file the the target path relative to the module base path while setting
+    /// the given unix permissions
+    fn add_file_with_permissions(
+        &mut self,
+        target: impl AsRef<Path>,
+        source: impl AsRef<Path>,
+        permissions: u32,
+    ) -> Result<()> {
+        let read_failed_context = format!("Failed to read {}", source.as_ref().display());
+        let mut file = File::open(source.as_ref()).context(read_failed_context.clone())?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer).context(read_failed_context)?;
+        self.add_bytes_with_permissions(target.as_ref(), &buffer, permissions)
             .context(format!("Failed to write to {}", target.as_ref().display()))?;
         Ok(())
     }
@@ -157,9 +176,10 @@ impl ModuleWriter for PathWriter {
         let mut file = {
             #[cfg(not(target_os = "windows"))]
             {
-                fs::OpenOptions::new()
+                OpenOptions::new()
                     .create(true)
                     .write(true)
+                    .truncate(true)
                     .mode(_permissions)
                     .open(&path)
             }
@@ -554,11 +574,22 @@ pub fn write_bindings_module(
     project_layout: &ProjectLayout,
     module_name: &str,
     artifact: &Path,
-    python_interpreter: &PythonInterpreter,
+    python_interpreter: Option<&PythonInterpreter>,
+    target: &Target,
     develop: bool,
-    abi3: bool,
 ) -> Result<()> {
-    let so_filename = python_interpreter.get_library_name(&module_name, abi3);
+    let so_filename = match python_interpreter {
+        Some(python_interpreter) => python_interpreter.get_library_name(&module_name),
+        // abi3
+        None => {
+            if target.is_freebsd() || target.is_unix() {
+                format!("{base}.abi3.so", base = module_name)
+            } else {
+                // Apparently there is no tag for abi3 on windows
+                format!("{base}.pyd", base = module_name)
+            }
+        }
+    };
 
     match project_layout {
         ProjectLayout::Mixed(ref python_module) => {
@@ -574,10 +605,14 @@ pub fn write_bindings_module(
                 ))?;
             }
 
-            writer.add_file(Path::new(&module_name).join(&so_filename), &artifact)?;
+            writer.add_file_with_permissions(
+                Path::new(&module_name).join(&so_filename),
+                &artifact,
+                0o755,
+            )?;
         }
         ProjectLayout::PureRust => {
-            writer.add_file(so_filename, &artifact)?;
+            writer.add_file_with_permissions(so_filename, &artifact, 0o755)?;
         }
     }
 
@@ -625,7 +660,7 @@ pub fn write_cffi_module(
     writer.add_directory(&module)?;
     writer.add_bytes(&module.join("__init__.py"), cffi_init_file().as_bytes())?;
     writer.add_bytes(&module.join("ffi.py"), cffi_declarations.as_bytes())?;
-    writer.add_file(&module.join("native.so"), &artifact)?;
+    writer.add_file_with_permissions(&module.join("native.so"), &artifact, 0o755)?;
 
     Ok(())
 }
@@ -647,10 +682,7 @@ pub fn write_bin(
     writer.add_directory(&data_dir)?;
 
     // We can't use add_file since we need to mark the file as executable
-    let mut file = File::open(artifact)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
-    writer.add_bytes_with_permissions(&data_dir.join(bin_name), &buffer, 0o755)?;
+    writer.add_file_with_permissions(&data_dir.join(bin_name), artifact, 0o755)?;
     Ok(())
 }
 

@@ -1,9 +1,11 @@
 use crate::build_context::BridgeModel;
 use crate::BuildContext;
 use crate::PythonInterpreter;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use fat_macho::FatWriter;
+use fs_err::{self as fs, File};
 use std::collections::HashMap;
-use std::fs::File;
+use std::env;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -17,24 +19,96 @@ pub fn compile(
     python_interpreter: Option<&PythonInterpreter>,
     bindings_crate: &BridgeModel,
 ) -> Result<HashMap<String, PathBuf>> {
-    let mut shared_args = vec!["--manifest-path", context.manifest_path.to_str().unwrap()];
+    if context.target.is_macos() && context.universal2 {
+        let build_type = match bindings_crate {
+            BridgeModel::Bin => "bin",
+            _ => "cdylib",
+        };
+        let aarch64_artifact = compile_target(
+            context,
+            python_interpreter,
+            bindings_crate,
+            "aarch64-apple-darwin",
+        )
+        .context("Failed to build a aarch64 library through cargo")?
+        .get(build_type)
+        .cloned()
+        .ok_or_else(|| {
+            if build_type == "cdylib" {
+                anyhow!(
+                    "Cargo didn't build an aarch64 cdylib. Did you miss crate-type = [\"cdylib\"] \
+                 in the lib section of your Cargo.toml?",
+                )
+            } else {
+                anyhow!("Cargo didn't build an aarch64 bin.")
+            }
+        })?;
+        let x86_64_artifact = compile_target(
+            context,
+            python_interpreter,
+            bindings_crate,
+            "x86_64-apple-darwin",
+        )
+        .context("Failed to build a x86_64 library through cargo")?
+        .get(build_type)
+        .cloned()
+        .ok_or_else(|| {
+            if build_type == "cdylib" {
+                anyhow!(
+                    "Cargo didn't build a x86_64 cdylib. Did you miss crate-type = [\"cdylib\"] \
+                 in the lib section of your Cargo.toml?",
+                )
+            } else {
+                anyhow!("Cargo didn't build a x86_64 bin.")
+            }
+        })?;
 
-    // We need to pass --bins / --lib to set the rustc extra args later
-    // TODO: What do we do when there are multiple bin targets?
-    match bindings_crate {
-        BridgeModel::Bin => shared_args.push("--bins"),
-        BridgeModel::Cffi | BridgeModel::Bindings(_) | BridgeModel::BindingsAbi3 => {
-            shared_args.push("--lib")
-        }
+        // Create an universal dylib
+        let output_path = aarch64_artifact
+            .display()
+            .to_string()
+            .replace("aarch64-apple-darwin/", "");
+        let mut writer = FatWriter::new();
+        let aarch64_file = fs::read(aarch64_artifact)?;
+        let x86_64_file = fs::read(x86_64_artifact)?;
+        writer
+            .add(aarch64_file)
+            .map_err(|e| anyhow!("Failed to add aarch64 cdylib: {:?}", e))?;
+        writer
+            .add(x86_64_file)
+            .map_err(|e| anyhow!("Failed to add x86_64 cdylib: {:?}", e))?;
+        writer
+            .write_to_file(&output_path)
+            .map_err(|e| anyhow!("Failed to create unversal cdylib: {:?}", e))?;
+
+        let mut result = HashMap::new();
+        result.insert(build_type.to_string(), PathBuf::from(output_path));
+        Ok(result)
+    } else {
+        compile_target(
+            context,
+            python_interpreter,
+            bindings_crate,
+            context.target.target_triple(),
+        )
     }
+}
+
+fn compile_target(
+    context: &BuildContext,
+    python_interpreter: Option<&PythonInterpreter>,
+    bindings_crate: &BridgeModel,
+    target: &str,
+) -> Result<HashMap<String, PathBuf>> {
+    let mut shared_args = vec!["--manifest-path", context.manifest_path.to_str().unwrap()];
 
     shared_args.extend(context.cargo_extra_args.iter().map(String::as_str));
 
     if context.release {
         shared_args.push("--release");
     }
-
-    let cargo_args = vec!["rustc", "--message-format", "json"];
+    shared_args.push("--target");
+    shared_args.push(target);
 
     let mut rustc_args: Vec<&str> = context
         .rustc_extra_args
@@ -42,10 +116,47 @@ pub fn compile(
         .map(String::as_str)
         .collect();
 
+    let mut rust_flags = env::var_os("RUSTFLAGS").unwrap_or_default();
+
+    // We need to pass --bins / --lib to set the rustc extra args later
+    // TODO: What do we do when there are multiple bin targets?
+    match bindings_crate {
+        BridgeModel::Bin => shared_args.push("--bins"),
+        BridgeModel::Cffi | BridgeModel::Bindings(_) | BridgeModel::BindingsAbi3(_, _) => {
+            shared_args.push("--lib");
+            // https://github.com/rust-lang/rust/issues/59302#issue-422994250
+            // We must only do this for libraries as it breaks binaries
+            // For some reason this value is ignored when passed as rustc argument
+            if context.target.is_musl_target() {
+                rust_flags.push(" -C target-feature=-crt-static");
+            }
+        }
+    }
+
+    let module_name = &context.module_name;
+    let so_filename = match python_interpreter {
+        Some(python_interpreter) => python_interpreter.get_library_name(module_name),
+        // abi3
+        None => {
+            format!("{base}.abi3.so", base = module_name)
+        }
+    };
+    // Change LC_ID_DYLIB to the finaly .so name for macOS targets to avoid linking with
+    // non-existent library.
+    // See https://github.com/PyO3/setuptools-rust/issues/106 for detail
+    let macos_dylib_install_name = format!("link-args=-Wl,-install_name,@rpath/{}", so_filename);
+
     // https://github.com/PyO3/pyo3/issues/88#issuecomment-337744403
     if context.target.is_macos() {
-        if let BridgeModel::Bindings(_) | BridgeModel::BindingsAbi3 = bindings_crate {
-            let mac_args = &["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"];
+        if let BridgeModel::Bindings(_) | BridgeModel::BindingsAbi3(_, _) = bindings_crate {
+            let mac_args = &[
+                "-C",
+                "link-arg=-undefined",
+                "-C",
+                "link-arg=dynamic_lookup",
+                "-C",
+                &macos_dylib_install_name,
+            ];
             rustc_args.extend(mac_args);
         }
     }
@@ -53,6 +164,25 @@ pub fn compile(
     if context.strip {
         rustc_args.extend(&["-C", "link-arg=-s"]);
     }
+
+    let pythonxy_lib_folder;
+    if let BridgeModel::BindingsAbi3(_, _) = bindings_crate {
+        // NB: We set PYO3_NO_PYTHON further below.
+        // On linux, we can build a shared library without the python
+        // providing these symbols being present, on mac we can do it with
+        // the `-undefined dynamic_lookup` we use above anyway. On windows
+        // however, we get an exit code 0xc0000005 if we try the same with
+        // `/FORCE:UNDEFINED`, so we still look up the python interpreter
+        // and pass the location of the lib with the definitions.
+        if context.target.is_windows() {
+            let python_interpreter = python_interpreter
+                .expect("Must have a python interpreter for building abi3 on windows");
+            pythonxy_lib_folder = format!("native={}", python_interpreter.libs_dir.display());
+            rustc_args.extend(&["-L", &pythonxy_lib_folder]);
+        }
+    }
+
+    let cargo_args = vec!["rustc", "--message-format", "json"];
 
     let build_args: Vec<_> = cargo_args
         .iter()
@@ -66,12 +196,19 @@ pub fn compile(
 
     let mut let_binding = Command::new("cargo");
     let build_command = let_binding
+        .env("RUSTFLAGS", rust_flags)
         .args(&build_args)
         // We need to capture the json messages
         .stdout(Stdio::piped())
         // We can't get colored human and json messages from rustc as they are mutually exclusive,
         // but forwarding stderr is still useful in case there some non-json error
         .stderr(Stdio::inherit());
+
+    if let BridgeModel::BindingsAbi3(_, _) = bindings_crate {
+        // This will make pyo3's build script only set some predefined linker
+        // arguments without trying to read any python configuration
+        build_command.env("PYO3_NO_PYTHON", "1");
+    }
 
     if let Some(python_interpreter) = python_interpreter {
         if bindings_crate.is_bindings("pyo3") {
@@ -93,10 +230,25 @@ pub fn compile(
     for message in cargo_metadata::Message::parse_stream(BufReader::new(stream)) {
         match message.context("Failed to parse message coming from cargo")? {
             cargo_metadata::Message::CompilerArtifact(artifact) => {
-                let crate_name = &context.cargo_metadata[&artifact.package_id].name;
+                let package_in_metadata = context
+                    .cargo_metadata
+                    .packages
+                    .iter()
+                    .find(|package| package.id == artifact.package_id);
+                let crate_name = match package_in_metadata {
+                    Some(package) => &package.name,
+                    None => {
+                        // This is a spurious error I don't really understand
+                        println!(
+                            "⚠  Warning: The package {} wasn't listed in `cargo metadata`",
+                            artifact.package_id
+                        );
+                        continue;
+                    }
+                };
 
                 // Extract the location of the .so/.dll/etc. from cargo's json output
-                if crate_name == &context.metadata21.name {
+                if crate_name == &context.crate_name {
                     let tuples = artifact
                         .target
                         .crate_types

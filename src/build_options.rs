@@ -1,5 +1,5 @@
 use crate::build_context::{BridgeModel, ProjectLayout};
-use crate::python_interpreter::Interpreter;
+use crate::python_interpreter::InterpreterKind;
 use crate::BuildContext;
 use crate::CargoToml;
 use crate::Manylinux;
@@ -9,7 +9,9 @@ use crate::Target;
 use anyhow::{bail, format_err, Context, Result};
 use cargo_metadata::{Metadata, MetadataCommand, Node};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::io;
 use std::path::PathBuf;
 use structopt::StructOpt;
 
@@ -18,19 +20,21 @@ use structopt::StructOpt;
 #[serde(default)]
 pub struct BuildOptions {
     /// Control the platform tag on linux. Options are `2010` (for manylinux2010),
-    /// `2014` (for manylinux2014) and `off` (for the native linux tag). Note that
-    /// manylinux1 is unsupported by the rust compiler. Wheels with the native tag
+    /// `2014` (for manylinux2014), `2_24` (for manylinux_2_24) and `off` (for the native linux tag).
+    /// Note that manylinux1 is unsupported by the rust compiler. Wheels with the native tag
     /// will be rejected by pypi, unless they are separately validated by
     /// `auditwheel`.
+    ///
+    /// The default is the lowest supported value for a target, which is 2010 for x86 and 2014 for
+    /// arm and powerpc.
     ///
     /// This option is ignored on all non-linux platforms
     #[structopt(
         long,
-        possible_values = &["2010", "2014", "off"],
+        possible_values = &["2010", "2014", "2_24", "off"],
         case_insensitive = true,
-        default_value = "2010"
     )]
-    pub manylinux: Manylinux,
+    pub manylinux: Option<Manylinux>,
     #[structopt(short, long)]
     /// The python versions to build wheels for, given as the names of the
     /// interpreters. Uses autodiscovery if not explicitly set.
@@ -55,7 +59,7 @@ pub struct BuildOptions {
     #[structopt(long = "skip-auditwheel")]
     pub skip_auditwheel: bool,
     /// The --target option for cargo
-    #[structopt(long, name = "TRIPLE")]
+    #[structopt(long, name = "TRIPLE", env = "CARGO_BUILD_TARGET")]
     pub target: Option<String>,
     /// Extra arguments that will be passed to cargo as `cargo rustc [...] [arg1] [arg2] --`
     ///
@@ -67,12 +71,16 @@ pub struct BuildOptions {
     /// Use as `--rustc-extra-args="--my-arg"`
     #[structopt(long = "rustc-extra-args")]
     pub rustc_extra_args: Vec<String>,
+    /// Control whether to build universal2 wheel for macOS or not.
+    /// Only applies to macOS targets, do nothing otherwise.
+    #[structopt(long)]
+    pub universal2: bool,
 }
 
 impl Default for BuildOptions {
     fn default() -> Self {
         BuildOptions {
-            manylinux: Manylinux::Manylinux2010,
+            manylinux: None,
             interpreter: Some(vec![]),
             bindings: None,
             manifest_path: PathBuf::from("Cargo.toml"),
@@ -81,6 +89,7 @@ impl Default for BuildOptions {
             target: None,
             cargo_extra_args: Vec::new(),
             rustc_extra_args: Vec::new(),
+            universal2: false,
         }
     }
 }
@@ -107,29 +116,40 @@ impl BuildOptions {
             .context("Failed to parse Cargo.toml into python metadata")?;
         let scripts = cargo_toml.scripts();
 
+        let crate_name = cargo_toml.package.name;
+
         // If the package name contains minuses, you must declare a module with
         // underscores as lib name
         let module_name = cargo_toml
             .lib
             .as_ref()
             .and_then(|lib| lib.name.as_ref())
-            .unwrap_or_else(|| &cargo_toml.package.name)
+            .unwrap_or(&crate_name)
             .to_owned();
 
         let project_layout = ProjectLayout::determine(manifest_dir, &module_name)?;
 
-        let mut cargo_extra_args = split_extra_args(&self.cargo_extra_args)?;
-        if let Some(target) = self.target.clone() {
-            cargo_extra_args.extend_from_slice(&["--target".to_string(), target]);
-        }
+        let cargo_extra_args = split_extra_args(&self.cargo_extra_args)?;
 
         let cargo_metadata_extra_args = extra_feature_args(&cargo_extra_args);
 
-        let cargo_metadata = MetadataCommand::new()
+        let result = MetadataCommand::new()
             .manifest_path(&self.manifest_path)
             .other_options(cargo_metadata_extra_args)
-            .exec()
-            .context("Cargo metadata failed. Do you have cargo in your PATH?")?;
+            .exec();
+
+        let cargo_metadata = match result {
+            Ok(cargo_metadata) => cargo_metadata,
+            Err(cargo_metadata::Error::Io(inner)) if inner.kind() == io::ErrorKind::NotFound => {
+                // NotFound is the specific error when cargo is not in PATH
+                return Err(inner)
+                    .context("Cargo metadata failed. Do you have cargo in your PATH?");
+            }
+            Err(err) => {
+                return Err(err)
+                    .context("Cargo metadata failed. Does your crate compile with `cargo build`?");
+            }
+        };
 
         let bridge = find_bridge(&cargo_metadata, self.bindings.as_deref())?;
 
@@ -141,6 +161,9 @@ impl BuildOptions {
         }
 
         let target = Target::from_target_triple(self.target.clone())?;
+        let manylinux = self
+            .manylinux
+            .unwrap_or_else(|| target.get_default_manylinux_tag());
 
         let wheel_dir = match self.out {
             Some(ref dir) => dir.clone(),
@@ -148,7 +171,7 @@ impl BuildOptions {
         };
 
         let interpreter = match self.interpreter {
-            // Only build a source ditribution
+            // Only build a source distribution
             Some(ref interpreter) if interpreter.is_empty() => vec![],
             // User given list of interpreters
             Some(interpreter) => find_interpreter(&bridge, &interpreter, &target)?,
@@ -158,44 +181,86 @@ impl BuildOptions {
 
         let rustc_extra_args = split_extra_args(&self.rustc_extra_args)?;
 
+        let mut universal2 = self.universal2;
+        // Also try to determine universal2 from ARCHFLAGS environment variable
+        if let Ok(arch_flags) = env::var("ARCHFLAGS") {
+            let arches: HashSet<&str> = arch_flags
+                .split("-arch")
+                .filter_map(|x| {
+                    let x = x.trim();
+                    if x.is_empty() {
+                        None
+                    } else {
+                        Some(x)
+                    }
+                })
+                .collect();
+            if arches.contains("x86_64") && arches.contains("arm64") {
+                universal2 = true;
+            }
+        };
+
         Ok(BuildContext {
             target,
             bridge,
             project_layout,
             metadata21,
             scripts,
+            crate_name,
             module_name,
             manifest_path: self.manifest_path,
             out: wheel_dir,
             release,
             strip,
             skip_auditwheel: self.skip_auditwheel,
-            manylinux: self.manylinux,
+            manylinux,
             cargo_extra_args,
             rustc_extra_args,
             interpreter,
             cargo_metadata,
+            universal2,
         })
     }
 }
 
 /// pyo3 supports building abi3 wheels if the unstable-api feature is not selected
-fn has_abi3(cargo_metadata: &Metadata) -> Result<bool> {
-    let pyo3_packages = cargo_metadata
-        .packages
+fn has_abi3(cargo_metadata: &Metadata) -> Result<Option<(u8, u8)>> {
+    let resolve = cargo_metadata
+        .resolve
+        .as_ref()
+        .context("Expected cargo to return metadata with resolve")?;
+    let pyo3_packages = resolve
+        .nodes
         .iter()
-        .filter(|package| package.name == "pyo3")
+        .filter(|package| cargo_metadata[&package.id].name == "pyo3")
         .collect::<Vec<_>>();
     match pyo3_packages.as_slice() {
         [pyo3_crate] => {
-            let root_id = cargo_metadata
-                .resolve
-                .as_ref()
-                .and_then(|resolve| resolve.root.as_ref())
-                .context("Expected cargo to return a root package")?;
-            // Check that we have a pyo3 version with abi3 and that abi3 is selected
-            Ok(pyo3_crate.features.contains_key("abi3")
-                && !cargo_metadata[&root_id].features.contains_key("abi3"))
+            // Find the minimal abi3 python version. If there is none, abi3 hasn't been selected
+            // This parser abi3-py{major}{minor} and returns the minimal (major, minor) tuple
+            let abi3_selected = pyo3_crate.features.iter().any(|x| x == "abi3");
+
+            let min_abi3_version = pyo3_crate
+                .features
+                .iter()
+                .filter(|x| x.starts_with("abi3-py") && x.len() == "abi3-pyxx".len())
+                .map(|x| {
+                    Ok((
+                        (x.as_bytes()[7] as char).to_string().parse::<u8>()?,
+                        (x.as_bytes()[8] as char).to_string().parse::<u8>()?,
+                    ))
+                })
+                .collect::<Result<Vec<(u8, u8)>>>()
+                .context("Bogus pyo3 cargo features")?
+                .into_iter()
+                .min();
+            if abi3_selected && min_abi3_version.is_none() {
+                bail!(
+                    "You have selected the `abi3` feature but not a minimum version (e.g. the `abi3-py36` feature). \
+                    maturin needs a minimum version feature to build abi3 wheels."
+                )
+            }
+            Ok(min_abi3_version)
         }
         _ => bail!(format!(
             "Expected exactly one pyo3 dependency, found {}",
@@ -221,6 +286,7 @@ pub fn find_bridge(cargo_metadata: &Metadata, bridge: Option<&str>) -> Result<Br
         if bindings == "cffi" {
             BridgeModel::Cffi
         } else if bindings == "bin" {
+            println!("🔗 Found bin bindings");
             BridgeModel::Bin
         } else {
             if !deps.contains_key(bindings) {
@@ -268,9 +334,12 @@ pub fn find_bridge(cargo_metadata: &Metadata, bridge: Option<&str>) -> Result<Br
             );
         }
 
-        if has_abi3(&cargo_metadata)? {
-            println!("🔗 Found pyo3 bindings with abi3 support");
-            return Ok(BridgeModel::BindingsAbi3);
+        if let Some((major, minor)) = has_abi3(&cargo_metadata)? {
+            println!(
+                "🔗 Found pyo3 bindings with abi3 support for Python ≥ {}.{}",
+                major, minor
+            );
+            return Ok(BridgeModel::BindingsAbi3(major, minor));
         } else {
             println!("🔗 Found pyo3 bindings");
             return Ok(bridge);
@@ -278,6 +347,32 @@ pub fn find_bridge(cargo_metadata: &Metadata, bridge: Option<&str>) -> Result<Br
     }
 
     Ok(bridge)
+}
+
+/// Shared between cffi and pyo3-abi3
+fn find_single_python_interpreter(
+    bridge: &BridgeModel,
+    interpreter: &[PathBuf],
+    target: &Target,
+    bridge_name: &str,
+) -> Result<PythonInterpreter> {
+    let err_message = "Failed to find a python interpreter";
+
+    let executable = if interpreter.is_empty() {
+        target.get_python()
+    } else if interpreter.len() == 1 {
+        interpreter[0].clone()
+    } else {
+        bail!(
+            "You can only specify one python interpreter for {}",
+            bridge_name
+        );
+    };
+
+    let interpreter = PythonInterpreter::check_executable(executable, &target, &bridge)
+        .context(format_err!(err_message))?
+        .ok_or_else(|| format_err!(err_message))?;
+    Ok(interpreter)
 }
 
 /// Finds the appropriate amount for python versions for each [BridgeModel].
@@ -288,8 +383,6 @@ pub fn find_interpreter(
     interpreter: &[PathBuf],
     target: &Target,
 ) -> Result<Vec<PythonInterpreter>> {
-    let err_message = "Failed to find a python interpreter";
-
     match bridge {
         BridgeModel::Bindings(_) => {
             let interpreter = if !interpreter.is_empty() {
@@ -315,55 +408,47 @@ pub fn find_interpreter(
 
             Ok(interpreter)
         }
-        BridgeModel::BindingsAbi3 => {
-            let interpreter = if interpreter.is_empty() {
-                // Since we do not autodetect pypy anyway, we only need one interpreter.
-                // Ideally we'd pick the lowest supported version, but there's no way to
-                // specify that yet in pyo3 yet
-                let interpreter =
-                    PythonInterpreter::check_executable(target.get_python(), &target, &bridge)
-                        .context(format_err!(err_message))?
-                        .ok_or_else(|| format_err!(err_message))?;
-                vec![interpreter]
-            } else {
-                let interpreter =
-                    PythonInterpreter::check_executables(&interpreter, &target, &bridge)
-                        .context("The given list of python interpreters is invalid")?;
-                // It's ok if there are pypy versions, but there should be either no or exactly one
-                // cpython version. We can build wheels for more since the minimum version is in
-                // the tag, but that is unnecessary
-                if interpreter
-                    .iter()
-                    .filter(|python| python.interpreter == Interpreter::CPython)
-                    .count()
-                    > 1
-                {
-                    println!("⚠ You have more than one cpython version specified when compiling with abi3, \
-                     while you only need to lowest compatible version to build a single abi3 wheel.");
-                }
-                interpreter
-            };
-
-            Ok(interpreter)
-        }
         BridgeModel::Cffi => {
-            let executable = if interpreter.is_empty() {
-                target.get_python()
-            } else if interpreter.len() == 1 {
-                interpreter[0].clone()
-            } else {
-                bail!("You can only specify one python interpreter for cffi compilation");
-            };
-
-            let interpreter = PythonInterpreter::check_executable(executable, &target, &bridge)
-                .context(format_err!(err_message))?
-                .ok_or_else(|| format_err!(err_message))?;
-
+            let interpreter = find_single_python_interpreter(bridge, interpreter, target, "cffi")?;
             println!("🐍 Using {} to generate the cffi bindings", interpreter);
-
             Ok(vec![interpreter])
         }
         BridgeModel::Bin => Ok(vec![]),
+        BridgeModel::BindingsAbi3(major, minor) => {
+            // Ideally, we wouldn't want to use any python interpreter without abi3 at all.
+            // Unfortunately, on windows we need one to figure out base_prefix for a linker
+            // argument.
+            if target.is_windows() {
+                if let Some(manual_base_prefix) = std::env::var_os("PYO3_CROSS_LIB_DIR") {
+                    // PYO3_CROSS_LIB_DIR should point to the `libs` directory inside base_prefix
+                    // when cross compiling, so we fake a python interpreter matching it
+                    println!("⚠ Cross-compiling is poorly supported");
+                    Ok(vec![PythonInterpreter {
+                        major: *major as usize,
+                        minor: *minor as usize,
+                        abiflags: "".to_string(),
+                        target: target.clone(),
+                        executable: PathBuf::new(),
+                        ext_suffix: Some(".pyd".to_string()),
+                        interpreter_kind: InterpreterKind::CPython,
+                        abi_tag: None,
+                        libs_dir: PathBuf::from(manual_base_prefix),
+                    }])
+                } else {
+                    let interpreter = find_single_python_interpreter(
+                        bridge,
+                        interpreter,
+                        target,
+                        "abi3 on windows",
+                    )?;
+                    println!("🐍 Using {} to generate to link bindings (With abi3, an interpreter is only required on windows)", interpreter);
+                    Ok(vec![interpreter])
+                }
+            } else {
+                println!("🐍 Not using a specific python interpreter (With abi3, an interpreter is only required on windows)");
+                Ok(vec![])
+            }
+        }
     }
 }
 
@@ -447,11 +532,11 @@ mod test {
 
         assert!(matches!(
             find_bridge(&pyo3_pure, None),
-            Ok(BridgeModel::BindingsAbi3)
+            Ok(BridgeModel::BindingsAbi3(3, 6))
         ));
         assert!(matches!(
             find_bridge(&pyo3_pure, Some("pyo3")),
-            Ok(BridgeModel::BindingsAbi3)
+            Ok(BridgeModel::BindingsAbi3(3, 6))
         ));
         assert!(find_bridge(&pyo3_pure, Some("rust-cpython")).is_err());
     }
@@ -471,10 +556,10 @@ mod test {
             .exec()
             .unwrap();
 
-        assert!(match find_bridge(&pyo3_pure, None).unwrap() {
-            BridgeModel::Bindings(_) => true,
-            _ => false,
-        });
+        assert!(matches!(
+            find_bridge(&pyo3_pure, None).unwrap(),
+            BridgeModel::Bindings(_)
+        ));
     }
 
     #[test]

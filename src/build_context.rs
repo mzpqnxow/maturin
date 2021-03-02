@@ -5,15 +5,15 @@ use crate::compile::warn_missing_py_init;
 use crate::module_writer::write_python_part;
 use crate::module_writer::WheelWriter;
 use crate::module_writer::{write_bin, write_bindings_module, write_cffi_module};
-use crate::source_distribution::{get_pyproject_toml, source_distribution, warn_on_local_deps};
+use crate::source_distribution::{get_pyproject_toml, source_distribution};
 use crate::Manylinux;
 use crate::Metadata21;
 use crate::PythonInterpreter;
 use crate::Target;
 use anyhow::{anyhow, bail, Context, Result};
 use cargo_metadata::Metadata;
+use fs_err as fs;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The way the rust code is used in the wheel
@@ -27,8 +27,9 @@ pub enum BridgeModel {
     /// providing crate, e.g. pyo3.
     Bindings(String),
     /// `Bindings`, but specifically for pyo3 with feature flags that allow building a single wheel
-    /// for all cpython versions (pypy still needs multiple versions)
-    BindingsAbi3,
+    /// for all cpython versions (pypy still needs multiple versions).
+    /// The numbers are the minimum major and minor version
+    BindingsAbi3(u8, u8),
 }
 
 impl BridgeModel {
@@ -90,6 +91,8 @@ pub struct BuildContext {
     pub metadata21: Metadata21,
     /// The `[console_scripts]` for the entry_points.txt
     pub scripts: HashMap<String, String>,
+    /// The name of the crate
+    pub crate_name: String,
     /// The name of the module can be distinct from the package name, mostly
     /// because package names normally contain minuses while module names
     /// have underscores. The package name is part of metadata21
@@ -115,9 +118,11 @@ pub struct BuildContext {
     pub interpreter: Vec<PythonInterpreter>,
     /// Cargo.toml as resolved by [cargo_metadata]
     pub cargo_metadata: Metadata,
+    /// Whether to use universal2 or use the native macOS tag (off)
+    pub universal2: bool,
 }
 
-type BuiltWheelMetadata = (PathBuf, String, Option<PythonInterpreter>);
+type BuiltWheelMetadata = (PathBuf, String);
 
 impl BuildContext {
     /// Checks which kind of bindings we have (pyo3/rust-cypthon or cffi or bin) and calls the
@@ -128,9 +133,13 @@ impl BuildContext {
             .context("Failed to create the target directory for the wheels")?;
 
         let wheels = match &self.bridge {
-            BridgeModel::Cffi => vec![(self.build_cffi_wheel()?, "py3".to_string(), None)],
-            BridgeModel::Bin => vec![(self.build_bin_wheel()?, "py3".to_string(), None)],
-            BridgeModel::Bindings(_) | BridgeModel::BindingsAbi3 => self.build_binding_wheels()?,
+            BridgeModel::Cffi => vec![(self.build_cffi_wheel()?, "py3".to_string())],
+            BridgeModel::Bin => vec![(self.build_bin_wheel()?, "py3".to_string())],
+            BridgeModel::Bindings(_) => self.build_binding_wheels()?,
+            BridgeModel::BindingsAbi3(major, minor) => vec![(
+                self.build_binding_wheel_abi3(*major, *minor)?,
+                format!("cp{}{}", major, minor),
+            )],
         };
 
         Ok(wheels)
@@ -143,18 +152,61 @@ impl BuildContext {
 
         match get_pyproject_toml(self.manifest_path.parent().unwrap()) {
             Ok(pyproject) => {
-                warn_on_local_deps(&self.cargo_metadata);
                 let sdist_path = source_distribution(
                     &self.out,
                     &self.metadata21,
                     &self.manifest_path,
+                    &self.cargo_metadata,
                     pyproject.sdist_include(),
                 )
                 .context("Failed to build source distribution")?;
-                Ok(Some((sdist_path, "source".to_string(), None)))
+                Ok(Some((sdist_path, "source".to_string())))
             }
             Err(_) => Ok(None),
         }
+    }
+
+    /// For abi3 we only need to build a single wheel and we don't even need a python interpreter
+    /// for it
+    pub fn build_binding_wheel_abi3(&self, major: u8, min_minor: u8) -> Result<PathBuf> {
+        // On windows, we have picked an interpreter to set the location of python.lib,
+        // otherwise it's none
+        let artifact = self.compile_cdylib(self.interpreter.get(0), Some(&self.module_name))?;
+
+        let platform = self
+            .target
+            .get_platform_tag(&self.manylinux, self.universal2);
+        let tag = format!("cp{}{}-abi3-{}", major, min_minor, platform);
+
+        let mut writer = WheelWriter::new(
+            &tag,
+            &self.out,
+            &self.metadata21,
+            &self.scripts,
+            &[tag.clone()],
+        )?;
+
+        write_bindings_module(
+            &mut writer,
+            &self.project_layout,
+            &self.module_name,
+            &artifact,
+            None,
+            &self.target,
+            false,
+        )
+        .context("Failed to add the files to the wheel")?;
+
+        let wheel_path = writer.finish()?;
+
+        println!(
+            "📦 Built wheel for abi3 Python ≥ {}.{} to {}",
+            major,
+            min_minor,
+            wheel_path.display()
+        );
+
+        Ok(wheel_path)
     }
 
     /// Builds wheels for a Cargo project for all given python versions.
@@ -164,16 +216,13 @@ impl BuildContext {
     /// and silently ignores all non-existent python versions.
     ///
     /// Runs [auditwheel_rs()] if not deactivated
-    pub fn build_binding_wheels(
-        &self,
-    ) -> Result<Vec<(PathBuf, String, Option<PythonInterpreter>)>> {
+    pub fn build_binding_wheels(&self) -> Result<Vec<(PathBuf, String)>> {
         let mut wheels = Vec::new();
         for python_interpreter in &self.interpreter {
             let artifact =
                 self.compile_cdylib(Some(&python_interpreter), Some(&self.module_name))?;
 
-            let tag = python_interpreter
-                .get_tag(&self.manylinux, self.bridge == BridgeModel::BindingsAbi3);
+            let tag = python_interpreter.get_tag(&self.manylinux, self.universal2);
 
             let mut writer = WheelWriter::new(
                 &tag,
@@ -188,9 +237,9 @@ impl BuildContext {
                 &self.project_layout,
                 &self.module_name,
                 &artifact,
-                python_interpreter,
+                Some(&python_interpreter),
+                &self.target,
                 false,
-                self.bridge == BridgeModel::BindingsAbi3,
             )
             .context("Failed to add the files to the wheel")?;
 
@@ -198,7 +247,7 @@ impl BuildContext {
 
             println!(
                 "📦 Built wheel for {} {}.{}{} to {}",
-                python_interpreter.interpreter,
+                python_interpreter.interpreter_kind,
                 python_interpreter.major,
                 python_interpreter.minor,
                 python_interpreter.abiflags,
@@ -208,7 +257,6 @@ impl BuildContext {
             wheels.push((
                 wheel_path,
                 format!("cp{}{}", python_interpreter.major, python_interpreter.minor),
-                Some(python_interpreter.clone()),
             ));
         }
 
@@ -241,7 +289,7 @@ impl BuildContext {
                 .unwrap_or(&self.target);
 
             auditwheel_rs(&artifact, target, &self.manylinux)
-                .context("Failed to ensure manylinux compliance")?;
+                .context(format!("Failed to ensure {} compliance", self.manylinux))?;
         }
 
         if let Some(module_name) = module_name {
@@ -256,7 +304,9 @@ impl BuildContext {
     pub fn build_cffi_wheel(&self) -> Result<PathBuf> {
         let artifact = self.compile_cdylib(None, None)?;
 
-        let (tag, tags) = self.target.get_universal_tags(&self.manylinux);
+        let (tag, tags) = self
+            .target
+            .get_universal_tags(&self.manylinux, self.universal2);
 
         let mut builder =
             WheelWriter::new(&tag, &self.out, &self.metadata21, &self.scripts, &tags)?;
@@ -292,9 +342,11 @@ impl BuildContext {
 
         #[cfg(feature = "auditwheel")]
         auditwheel_rs(&artifact, &self.target, &self.manylinux)
-            .context("Failed to ensure manylinux compliance")?;
+            .context(format!("Failed to ensure {} compliance", self.manylinux))?;
 
-        let (tag, tags) = self.target.get_universal_tags(&self.manylinux);
+        let (tag, tags) = self
+            .target
+            .get_universal_tags(&self.manylinux, self.universal2);
 
         if !self.scripts.is_empty() {
             bail!("Defining entrypoints and working with a binary doesn't mix well");

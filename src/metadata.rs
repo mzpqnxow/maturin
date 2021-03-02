@@ -1,9 +1,9 @@
 use crate::CargoToml;
 use anyhow::{Context, Result};
+use fs_err as fs;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
 use std::str;
 
@@ -44,13 +44,13 @@ pub struct Metadata21 {
     pub maintainer: Option<String>,
     pub maintainer_email: Option<String>,
     pub license: Option<String>,
-    pub classifier: Vec<String>,
+    pub classifiers: Vec<String>,
     pub requires_dist: Vec<String>,
     pub provides_dist: Vec<String>,
     pub obsoletes_dist: Vec<String>,
     pub requires_python: Option<String>,
     pub requires_external: Vec<String>,
-    pub project_url: Vec<String>,
+    pub project_url: HashMap<String, String>,
     pub provides_extra: Vec<String>,
 }
 
@@ -85,7 +85,7 @@ impl Metadata21 {
     ) -> Result<Metadata21> {
         let authors = cargo_toml.package.authors.join(", ");
 
-        let classifier = cargo_toml.classifier();
+        let classifiers = cargo_toml.classifiers();
 
         let author_email = if authors.contains('@') {
             Some(authors.clone())
@@ -100,7 +100,7 @@ impl Metadata21 {
         // See https://packaging.python.org/specifications/core-metadata/#description
         if let Some(ref readme) = cargo_toml.package.readme {
             let readme_path = manifest_path.as_ref().join(readme);
-            description = Some(read_to_string(&readme_path).context(format!(
+            description = Some(fs::read_to_string(&readme_path).context(format!(
                 "Failed to read readme specified in Cargo.toml, which should be at {}",
                 readme_path.display()
             ))?);
@@ -117,7 +117,9 @@ impl Metadata21 {
             metadata_version: "2.1".to_owned(),
 
             // Mapped from cargo metadata
-            name: cargo_toml.package.name.to_owned(),
+            name: extra_metadata
+                .name
+                .unwrap_or_else(|| cargo_toml.package.name.clone()),
             version: cargo_toml.package.version.clone(),
             summary: cargo_toml.package.description.clone(),
             description,
@@ -135,7 +137,7 @@ impl Metadata21 {
             license: cargo_toml.package.license.clone(),
 
             // Values provided through `[project.metadata.maturin]`
-            classifier,
+            classifiers,
             maintainer: extra_metadata.maintainer,
             maintainer_email: extra_metadata.maintainer_email,
             requires_dist: extra_metadata.requires_dist.unwrap_or_default(),
@@ -161,7 +163,7 @@ impl Metadata21 {
         let mut fields = vec![
             ("Metadata-Version", self.metadata_version.clone()),
             ("Name", self.name.clone()),
-            ("Version", self.version.clone()),
+            ("Version", self.get_version_escaped()),
         ];
 
         let mut add_vec = |name, values: &[String]| {
@@ -173,12 +175,11 @@ impl Metadata21 {
         add_vec("Supported-Platform", &self.supported_platform);
         add_vec("Platform", &self.platform);
         add_vec("Supported-Platform", &self.supported_platform);
-        add_vec("Classifier", &self.classifier);
+        add_vec("Classifiers", &self.classifiers);
         add_vec("Requires-Dist", &self.requires_dist);
         add_vec("Provides-Dist", &self.provides_dist);
         add_vec("Obsoletes-Dist", &self.obsoletes_dist);
         add_vec("Requires-External", &self.requires_external);
-        add_vec("Project-Url", &self.project_url);
         add_vec("Provides-Extra", &self.provides_extra);
 
         let mut add_option = |name, value: &Option<String>| {
@@ -198,9 +199,19 @@ impl Metadata21 {
         add_option("License", &self.license);
         add_option("Requires-Python", &self.requires_python);
         add_option("Description-Content-Type", &self.description_content_type);
+        // Project-URL is special
+        // "A string containing a browsable URL for the project and a label for it, separated by a comma."
+        // `Project-URL: Bug Tracker, http://bitbucket.org/tarek/distribute/issues/`
+        for (key, value) in self.project_url.iter() {
+            fields.push(("Project-URL", format!("{}, {}", key, value)))
+        }
+
         // Description shall be last, so we can ignore RFC822 and just put the description
         // in the body
-        add_option("Description", &self.description);
+        // The borrow checker doesn't like us using add_option here
+        if let Some(description) = &self.description {
+            fields.push(("Description", description.clone()));
+        }
 
         fields
             .into_iter()
@@ -334,8 +345,9 @@ mod test {
             ph = "maturin:print_hello"
 
             [package.metadata.maturin]
-            classifier = ["Programming Language :: Python"]
+            classifiers = ["Programming Language :: Python"]
             requires-dist = ["flask~=1.1.0", "toml==0.10.0"]
+            project-url = { "Bug Tracker" = "http://bitbucket.org/tarek/distribute/issues/" }
         "#
         );
 
@@ -344,7 +356,7 @@ mod test {
             Metadata-Version: 2.1
             Name: info-project
             Version: 0.1.0
-            Classifier: Programming Language :: Python
+            Classifiers: Programming Language :: Python
             Requires-Dist: flask~=1.1.0
             Requires-Dist: toml==0.10.0
             Summary: A test project
@@ -353,6 +365,7 @@ mod test {
             Author: konstin <konstin@mailbox.org>
             Author-Email: konstin <konstin@mailbox.org>
             Description-Content-Type: text/plain; charset=UTF-8
+            Project-URL: Bug Tracker, http://bitbucket.org/tarek/distribute/issues/
 
             # Some test package
 
@@ -391,7 +404,7 @@ mod test {
             ph = "maturin:print_hello"
 
             [package.metadata.maturin]
-            classifier = ["Programming Language :: Python"]
+            classifiers = ["Programming Language :: Python"]
             requires-dist = ["flask~=1.1.0", "toml==0.10.0"]
             description-content-type = "text/x-rst"
         "#
@@ -402,7 +415,7 @@ mod test {
             Metadata-Version: 2.1
             Name: info-project
             Version: 0.1.0
-            Classifier: Programming Language :: Python
+            Classifiers: Programming Language :: Python
             Requires-Dist: flask~=1.1.0
             Requires-Dist: toml==0.10.0
             Summary: A test project
@@ -421,8 +434,65 @@ mod test {
     }
 
     #[test]
+    fn test_metadata_from_cargo_toml_name_override() {
+        let cargo_toml = indoc!(
+            r#"
+            [package]
+            authors = ["konstin <konstin@mailbox.org>"]
+            name = "info-project"
+            version = "0.1.0"
+            description = "A test project"
+            homepage = "https://example.org"
+
+            [lib]
+            crate-type = ["cdylib"]
+            name = "pyo3_pure"
+
+            [package.metadata.maturin.scripts]
+            ph = "maturin:print_hello"
+
+            [package.metadata.maturin]
+            name = "info"
+            classifiers = ["Programming Language :: Python"]
+            description-content-type = "text/x-rst"
+        "#
+        );
+
+        let expected = indoc!(
+            r#"
+            Metadata-Version: 2.1
+            Name: info
+            Version: 0.1.0
+            Classifiers: Programming Language :: Python
+            Summary: A test project
+            Home-Page: https://example.org
+            Author: konstin <konstin@mailbox.org>
+            Author-Email: konstin <konstin@mailbox.org>
+        "#
+        );
+
+        let cargo_toml_struct: CargoToml = toml::from_str(&cargo_toml).unwrap();
+        let metadata = Metadata21::from_cargo_toml(&cargo_toml_struct, "").unwrap();
+        let actual = metadata.to_file_contents();
+
+        assert_eq!(
+            actual.trim(),
+            expected.trim(),
+            "Actual metadata differed from expected\nEXPECTED:\n{}\n\nGOT:\n{}",
+            expected,
+            actual
+        );
+
+        assert_eq!(
+            metadata.get_dist_info_dir(),
+            PathBuf::from("info-0.1.0.dist-info"),
+            "Dist info dir differed from expected"
+        );
+    }
+
+    #[test]
     fn test_path_to_content_type() {
-        for (filename, expected) in vec![
+        for (filename, expected) in &[
             ("r.md", GFM_CONTENT_TYPE),
             ("r.markdown", GFM_CONTENT_TYPE),
             ("r.mArKdOwN", GFM_CONTENT_TYPE),
@@ -432,7 +502,7 @@ mod test {
         ] {
             let result = path_to_content_type(&PathBuf::from(filename));
             assert_eq!(
-                result.as_str(),
+                &result.as_str(),
                 expected,
                 "Wrong content type for file '{}'. Expected '{}', got '{}'",
                 filename,

@@ -39,6 +39,7 @@ pub use crate::module_writer::{
     write_dist_info, ModuleWriter, PathWriter, SDistWriter, WheelWriter,
 };
 pub use crate::python_interpreter::PythonInterpreter;
+pub use crate::read_distribution::get_metadata_for_distribution;
 pub use crate::target::{Manylinux, Target};
 pub use source_distribution::{get_pyproject_toml, source_distribution};
 #[cfg(feature = "upload")]
@@ -57,6 +58,7 @@ mod develop;
 mod metadata;
 mod module_writer;
 mod python_interpreter;
+mod read_distribution;
 #[cfg(feature = "upload")]
 mod registry;
 mod source_distribution;

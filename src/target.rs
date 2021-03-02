@@ -1,5 +1,6 @@
 use anyhow::{bail, format_err, Result};
 use platform_info::*;
+use platforms::target::Env;
 use platforms::Platform;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -24,6 +25,9 @@ pub enum Manylinux {
     Manylinux2010,
     /// Use the manylinux2014 tag
     Manylinux2014,
+    /// Use the manylinux_2_24 tag
+    #[allow(non_camel_case_types)]
+    Manylinux_2_24,
     /// Use the native linux tag
     Off,
 }
@@ -33,6 +37,7 @@ impl fmt::Display for Manylinux {
         match *self {
             Manylinux::Manylinux2010 => write!(f, "manylinux2010"),
             Manylinux::Manylinux2014 => write!(f, "manylinux2014"),
+            Manylinux::Manylinux_2_24 => write!(f, "manylinux_2_24"),
             Manylinux::Off => write!(f, "linux"),
         }
     }
@@ -45,6 +50,7 @@ impl FromStr for Manylinux {
         match value {
             "2010" => Ok(Manylinux::Manylinux2010),
             "2014" => Ok(Manylinux::Manylinux2014),
+            "2_24" => Ok(Manylinux::Manylinux_2_24),
             "off" => Ok(Manylinux::Off),
             _ => Err("Invalid value for the manylinux option"),
         }
@@ -52,10 +58,12 @@ impl FromStr for Manylinux {
 }
 
 /// All supported CPU architectures
-#[derive(Debug, Clone, Eq, PartialEq)]
-enum Arch {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Arch {
     AARCH64,
     ARMV7L,
+    POWERPC64LE,
+    POWERPC64,
     X86,
     X86_64,
 }
@@ -65,6 +73,8 @@ impl fmt::Display for Arch {
         match *self {
             Arch::AARCH64 => write!(f, "aarch64"),
             Arch::ARMV7L => write!(f, "armv7l"),
+            Arch::POWERPC64LE => write!(f, "ppc64le"),
+            Arch::POWERPC64 => write!(f, "ppc64"),
             Arch::X86 => write!(f, "i686"),
             Arch::X86_64 => write!(f, "x86_64"),
         }
@@ -76,6 +86,8 @@ impl fmt::Display for Arch {
 pub struct Target {
     os: OS,
     arch: Arch,
+    env: Option<Env>,
+    triple: &'static str,
 }
 
 impl Target {
@@ -105,6 +117,16 @@ impl Target {
             platforms::target::Arch::X86 => Arch::X86,
             platforms::target::Arch::ARM => Arch::ARMV7L,
             platforms::target::Arch::AARCH64 => Arch::AARCH64,
+            platforms::target::Arch::POWERPC64
+                if platform.target_triple.starts_with("powerpc64-") =>
+            {
+                Arch::POWERPC64
+            }
+            platforms::target::Arch::POWERPC64
+                if platform.target_triple.starts_with("powerpc64le-") =>
+            {
+                Arch::POWERPC64LE
+            }
             unsupported => bail!("The architecture {:?} is not supported", unsupported),
         };
 
@@ -119,14 +141,18 @@ impl Target {
                     Err(error) => bail!(error),
                 };
             }
-            (OS::Macos, Arch::AARCH64) => bail!("aarch64 is not supported for macOS"),
             (OS::Macos, Arch::ARMV7L) => bail!("armv7l is not supported for macOS"),
             (OS::Macos, Arch::X86) => bail!("32-bit wheels are not supported for macOS"),
             (OS::Windows, Arch::AARCH64) => bail!("aarch64 is not supported for Windows"),
             (OS::Windows, Arch::ARMV7L) => bail!("armv7l is not supported for Windows"),
             (_, _) => {}
         }
-        Ok(Target { os, arch })
+        Ok(Target {
+            os,
+            arch,
+            env: platform.target_env,
+            triple: platform.target_triple,
+        })
     }
 
     /// Returns whether the platform is 64 bit or 32 bit
@@ -134,9 +160,21 @@ impl Target {
         match self.arch {
             Arch::AARCH64 => 64,
             Arch::ARMV7L => 32,
+            Arch::POWERPC64 => 64,
+            Arch::POWERPC64LE => 64,
             Arch::X86 => 32,
             Arch::X86_64 => 64,
         }
+    }
+
+    /// Returns target architecture
+    pub fn target_arch(&self) -> Arch {
+        self.arch
+    }
+
+    /// Returns target triple string
+    pub fn target_triple(&self) -> &str {
+        &self.triple
     }
 
     /// Returns true if the current platform is linux or mac os
@@ -164,8 +202,27 @@ impl Target {
         self.os == OS::Windows
     }
 
+    /// Returns true if the current platform's target env is Musl
+    pub fn is_musl_target(&self) -> bool {
+        match self.env {
+            Some(Env::Musl) => true,
+            Some(_) => false,
+            None => false,
+        }
+    }
+
+    /// Returns the default Manylinux tag for this architecture
+    pub fn get_default_manylinux_tag(&self) -> Manylinux {
+        match self.arch {
+            Arch::AARCH64 | Arch::ARMV7L | Arch::POWERPC64 | Arch::POWERPC64LE => {
+                Manylinux::Manylinux2014
+            }
+            Arch::X86 | Arch::X86_64 => Manylinux::Manylinux2010,
+        }
+    }
+
     /// Returns the platform part of the tag for the wheel name for cffi wheels
-    pub fn get_platform_tag(&self, manylinux: &Manylinux) -> String {
+    pub fn get_platform_tag(&self, manylinux: &Manylinux, universal2: bool) -> String {
         match (&self.os, &self.arch) {
             (OS::FreeBSD, Arch::X86_64) => {
                 let info = match PlatformInfo::new() {
@@ -176,7 +233,20 @@ impl Target {
                 format!("freebsd_{}_amd64", release)
             }
             (OS::Linux, _) => format!("{}_{}", manylinux, self.arch),
-            (OS::Macos, Arch::X86_64) => "macosx_10_7_x86_64".to_string(),
+            (OS::Macos, Arch::X86_64) => {
+                if universal2 {
+                    "macosx_10_9_universal2".to_string()
+                } else {
+                    "macosx_10_7_x86_64".to_string()
+                }
+            }
+            (OS::Macos, Arch::AARCH64) => {
+                if universal2 {
+                    "macosx_10_9_universal2".to_string()
+                } else {
+                    "macosx_11_0_arm64".to_string()
+                }
+            }
             (OS::Windows, Arch::X86) => "win32".to_string(),
             (OS::Windows, Arch::X86_64) => "win_amd64".to_string(),
             (_, _) => panic!("unsupported target should not have reached get_platform_tag()"),
@@ -184,19 +254,25 @@ impl Target {
     }
 
     /// Returns the tags for the WHEEL file for cffi wheels
-    pub fn get_py3_tags(&self, manylinux: &Manylinux) -> Vec<String> {
-        vec![format!("py3-none-{}", self.get_platform_tag(&manylinux))]
+    pub fn get_py3_tags(&self, manylinux: &Manylinux, universal2: bool) -> Vec<String> {
+        vec![format!(
+            "py3-none-{}",
+            self.get_platform_tag(&manylinux, universal2)
+        )]
     }
 
-    /// Returns the platform for the tag in the shared libaries file name
+    /// Returns the platform for the tag in the shared libraries file name
     pub fn get_shared_platform_tag(&self) -> &'static str {
         match (&self.os, &self.arch) {
             (OS::FreeBSD, _) => "", // according imp.get_suffixes(), there are no such
             (OS::Linux, Arch::AARCH64) => "aarch64-linux-gnu", // aka armv8-linux-gnueabihf
             (OS::Linux, Arch::ARMV7L) => "arm-linux-gnueabihf",
+            (OS::Linux, Arch::POWERPC64) => "powerpc64-linux-gnu",
+            (OS::Linux, Arch::POWERPC64LE) => "powerpc64le-linux-gnu",
             (OS::Linux, Arch::X86) => "i386-linux-gnu", // not i686
             (OS::Linux, Arch::X86_64) => "x86_64-linux-gnu",
             (OS::Macos, Arch::X86_64) => "darwin",
+            (OS::Macos, Arch::AARCH64) => "darwin",
             (OS::Windows, Arch::X86) => "win32",
             (OS::Windows, Arch::X86_64) => "win_amd64",
             (OS::Macos, _) => {
@@ -247,12 +323,16 @@ impl Target {
     }
 
     /// Returns the tags for the platform without python version
-    pub fn get_universal_tags(&self, manylinux: &Manylinux) -> (String, Vec<String>) {
+    pub fn get_universal_tags(
+        &self,
+        manylinux: &Manylinux,
+        universal2: bool,
+    ) -> (String, Vec<String>) {
         let tag = format!(
             "py3-none-{platform}",
-            platform = self.get_platform_tag(&manylinux)
+            platform = self.get_platform_tag(&manylinux, universal2)
         );
-        let tags = self.get_py3_tags(&manylinux);
+        let tags = self.get_py3_tags(&manylinux, universal2);
         (tag, tags)
     }
 }

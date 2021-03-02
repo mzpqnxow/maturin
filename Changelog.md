@@ -5,14 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (for the cli, not for the crate).
 
-## 0.9.0 - Unreleased
+## 0.10.0 - Unreleased
 
- * Added support for building abi3 wheels with pyo3 0.13
+ * Change manylinux default version based on target arch by messense in [#424](https://github.com/PyO3/maturin/pull/424)
+ * Support local path dependencies in source distribution (i.e. you can now package a workspace into an sdist)
+ * Set a more reasonable LC_ID_DYLIB entry on macOS by messense [#433](https://github.com/PyO3/maturin/pull/433)
+ * Add `--skip-existing` option to publish by messense [#444](https://github.com/PyO3/maturin/pull/444)
+ * maturn develop install dependencies automatically by messense [#443](https://github.com/PyO3/maturin/pull/443)
+ * Load credential from pypirc using repository name instead of package name by messense #[445](https://github.com/PyO3/maturin/pull/445)
+
+## 0.9.4 - 2021-02-18
+
+* Fix building a bin with musl 
+
+## 0.9.3
+
+* CI failure
+
+## 0.9.2 - 2021-02-17
+
+ * Escape version in wheel metadata by messense in [#420](https://github.com/PyO3/maturin/pull/420)
+ * Set executable bit on shared library by messense in [#421](https://github.com/PyO3/maturin/pull/421)
+ * Rename `classifier` to `classifiers` for pypi compatibility. The old `classifier` is still available and now also works with pypi 
+ * Fix building for musl by automatically setting `-C target-feature=-crt-static` 
+
+## 0.9.1 - 2021-01-13
+
+ * Error when the `abi3` feature is selected but no minimum version
+ * Support building universal2 wheels (x86 and aarch64 in a single file) by messense in [#403](https://github.com/PyO3/maturin/pull/403)
+ * Recognize `PYO3_CROSS_LIB_DIR` for cross compiling with abi3 targeting windows. 
+ * `package.metadata.maturin.classifier` is renamed to `classifiers` by kngwyu in [#416](https://github.com/PyO3/maturin/pull/416)
+ * Added more instructions to building complex manylinux setups
+
+## 0.9.0 - 2021-01-10
+
+ * Added support for building abi3 wheels with pyo3 0.13.1
  * Python 3.9 is supported (it should have worked before, but it is now tested on ci)
+ * There are 64-bit and aarch64 binary builds for linux and 64-bit builds for windows, mac and freebsd-12-1 
  * The auditwheel options have changed to `--manylinux=[off|2010|2014]` with manylinux2010 as default, and optionally `--skip-auditwheel`.
  * Removed Python 3.5 since it is unsupported 
  * The default and minimum manylinux version is now manylinux2010
  * restructured text (rst) readmes are now supported, by clbarnes in [#360](https://github.com/PyO3/maturin/pull/360)
+ * Allow python 3 interpreter with debuginfo use maturin by inevity in [#370](https://github.com/PyO3/maturin/pull/370)
+ * pypirc is checked for credentials by houqp in [#374](https://github.com/PyO3/maturin/pull/374)
+ * Added support for PowerPC by mzpqnxow and programmerjake in [#366](https://github.com/PyO3/maturin/pull/366)
+ * `project-url` is now a toml dictionary instead of a toml list to conform to the standard
+ * No more retry loop when the password was wrong
+ * When bootstrapping, also search for `cargo.exe` if `cargo` was not found
 
 ## 0.8.3 - 2020-08-17
 

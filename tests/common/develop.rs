@@ -1,41 +1,15 @@
-use crate::common::{adjust_canonicalization, check_installed, handle_result, maybe_mock_cargo};
+use crate::common::{adjust_canonicalization, check_installed, maybe_mock_cargo};
 use anyhow::Result;
+use fs_err as fs;
 use maturin::{develop, Target};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 use std::str;
-mod common;
-
-#[test]
-fn test_develop_pyo3_pure() {
-    handle_result(test_develop("test-crates/pyo3-pure", None));
-}
-
-#[test]
-fn test_develop_pyo3_mixed() {
-    handle_result(test_develop("test-crates/pyo3-mixed", None));
-}
-
-#[test]
-fn test_develop_cffi_pure() {
-    handle_result(test_develop("test-crates/cffi-pure", None));
-}
-
-#[test]
-fn test_develop_cffi_mixed() {
-    handle_result(test_develop("test-crates/cffi-mixed", None));
-}
-
-#[test]
-fn test_develop_hello_world() {
-    handle_result(test_develop("test-crates/hello-world", None));
-}
 
 /// Creates a virtualenv and activates it, checks that the package isn't installed, uses
 /// "maturin develop" to install it and checks it is working
-fn test_develop(package: impl AsRef<Path>, bindings: Option<String>) -> Result<()> {
+pub fn test_develop(package: impl AsRef<Path>, bindings: Option<String>) -> Result<()> {
     maybe_mock_cargo();
 
     let test_name = package
@@ -76,7 +50,7 @@ fn test_develop(package: impl AsRef<Path>, bindings: Option<String>) -> Result<(
     check_installed(&package.as_ref(), &python).unwrap_err();
 
     let output = Command::new(&python)
-        .args(&["-m", "pip", "install", "cffi"])
+        .args(&["-m", "pip", "install", "-U", "pip", "cffi"])
         .output()?;
     if !output.status.success() {
         panic!(
